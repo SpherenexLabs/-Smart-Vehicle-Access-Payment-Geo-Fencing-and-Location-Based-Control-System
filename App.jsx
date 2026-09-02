@@ -12,7 +12,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
             with Firebase/REST/MQTT/ESP32 calls later.
 */
 
-const GOOGLE_MAPS_API_KEY = "AIzaSyBPcK56RdMVKIrygAjikAFYNpQ0vNZVA1k";
+const GOOGLE_MAPS_API_KEY = "AIzaSyD1mcosVgoTAA_hZGcXOvG9fbEoqrRZk94";
 const SESSION_KEY = "smart_vehicle_access_session_v2";
 const DEFAULT_CENTER = { lat: 12.9716, lng: 77.5946 };
 const EMERGENCY_DB_URL = "https://diet-planner-3bdf3-default-rtdb.firebaseio.com/ALZHEIMER_PATIENTS.json";
@@ -121,6 +121,32 @@ function distanceMeters(a, b) {
   return 2 * R * Math.atan2(Math.sqrt(q), Math.sqrt(1 - q));
 }
 
+function pointInPolygon(point, polygon) {
+  if (!point || !Array.isArray(polygon) || polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].lng, yi = polygon[i].lat;
+    const xj = polygon[j].lng, yj = polygon[j].lat;
+    const intersects = yi > point.lat !== yj > point.lat &&
+      point.lng < ((xj - xi) * (point.lat - yi)) / (yj - yi) + xi;
+    if (intersects) inside = !inside;
+  }
+  return inside;
+}
+
+function isInsideGeoFence(point, fence) {
+  if (!fence?.enabled) return true;
+  if (!point) return false;
+  if (fence.shape === "polygon") return pointInPolygon(point, fence.polygon);
+  return distanceMeters(point, fence.center) <= Number(fence.radiusM);
+}
+
+function isValidLatLng(pos) {
+  return Boolean(pos) &&
+    Number.isFinite(pos.lat) && pos.lat >= -90 && pos.lat <= 90 &&
+    Number.isFinite(pos.lng) && pos.lng >= -180 && pos.lng <= 180;
+}
+
 function safeRead(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -142,8 +168,10 @@ function seedDb() {
     },
     settings: {
       geoFence: {
+        shape: "circle",
         center: DEFAULT_CENTER,
         radiusM: 20000,
+        polygon: [],
         arrivalRadiusM: 60,
         enabled: true,
       },
@@ -155,15 +183,16 @@ function seedDb() {
     },
     users: [],
     dropLocations: [
-      { id: uid("DROP"), name: "Main Gate", lat: 12.9716, lng: 77.5946, createdAt: created },
-      { id: uid("DROP"), name: "Block A", lat: 12.9761, lng: 77.6007, createdAt: created },
-      { id: uid("DROP"), name: "Block B", lat: 12.9659, lng: 77.6034, createdAt: created },
-      { id: uid("DROP"), name: "Block C", lat: 12.9700, lng: 77.5900, createdAt: created },
-      { id: uid("DROP"), name: "Parking", lat: 12.9684, lng: 77.5872, createdAt: created },
-      { id: uid("DROP"), name: "Library", lat: 12.9740, lng: 77.5960, createdAt: created },
-      { id: uid("DROP"), name: "Cafeteria", lat: 12.9680, lng: 77.5990, createdAt: created },
-      { id: uid("DROP"), name: "Hostel", lat: 12.9650, lng: 77.5920, createdAt: created },
-      { id: uid("DROP"), name: "Admin Office", lat: 12.9720, lng: 77.6020, createdAt: created },
+      { id: uid("DROP"), name: "Main Front Arch (Campus Entrance)", lat: 12.9038, lng: 77.4981, createdAt: created },
+      { id: uid("DROP"), name: "Ganesha Circle (Central Junction)", lat: 12.9022, lng: 77.4975, createdAt: created },
+      { id: uid("DROP"), name: "Gleneagles BGS Hospital", lat: 12.9032, lng: 77.4988, createdAt: created },
+      { id: uid("DROP"), name: "Medical Block (BGS GIMS)", lat: 12.9015, lng: 77.4970, createdAt: created },
+      { id: uid("DROP"), name: "BGS Global Institute of Allied Health Sciences", lat: 12.9012, lng: 77.4968, createdAt: created },
+      { id: uid("DROP"), name: "BGS Global College of Nursing", lat: 12.9009, lng: 77.4965, createdAt: created },
+      { id: uid("DROP"), name: "SJB Engineering Departments (SJBIT)", lat: 12.9004, lng: 77.4962, createdAt: created },
+      { id: uid("DROP"), name: "Central Library Block", lat: 12.8998, lng: 77.4958, createdAt: created },
+      { id: uid("DROP"), name: "SJB PU College", lat: 12.8991, lng: 77.4952, createdAt: created },
+      { id: uid("DROP"), name: "Sports Ground / Outdoor Arena", lat: 12.8982, lng: 77.4945, createdAt: created },
     ],
     rides: [],
     payments: [],
@@ -262,6 +291,7 @@ function statusTone(status = "") {
     s.includes("failed") ||
     s.includes("outside") ||
     s.includes("disabled") ||
+    s.includes("locked") ||
     s.includes("cancel") ||
     s.includes("not connected")
   )
@@ -335,6 +365,8 @@ function GoogleMapPanel({
   deliveryPoint,
   pickupPoint,
   destinationPoint,
+  onFenceCenterChange,
+  onPolygonPointAdd,
   title = "Live Google Map",
   height = 430,
 }) {
@@ -342,10 +374,17 @@ function GoogleMapPanel({
   const map = useRef(null);
   const overlays = useRef([]);
   const circle = useRef(null);
+  const fencePolygon = useRef(null);
   const routeLine = useRef(null);
   const [apiState, setApiState] = useState(
     window.google?.maps ? "ready" : "loading"
   );
+  const onFenceCenterChangeRef = useRef(onFenceCenterChange);
+  const onPolygonPointAddRef = useRef(onPolygonPointAdd);
+  useEffect(() => {
+    onFenceCenterChangeRef.current = onFenceCenterChange;
+    onPolygonPointAddRef.current = onPolygonPointAdd;
+  });
 
   useEffect(() => {
     if (window.google?.maps) {
@@ -377,7 +416,7 @@ function GoogleMapPanel({
 
   useEffect(() => {
     if (apiState !== "ready" || !mapNode.current || !window.google?.maps) return;
-    const center = currentLocation || geoFence?.center || DEFAULT_CENTER;
+    const center = [currentLocation, geoFence?.center, DEFAULT_CENTER].find(isValidLatLng) || DEFAULT_CENTER;
     if (!map.current) {
       map.current = new window.google.maps.Map(mapNode.current, {
         center,
@@ -387,6 +426,11 @@ function GoogleMapPanel({
         fullscreenControl: true,
         gestureHandling: "greedy",
       });
+      map.current.addListener("click", (e) => {
+        const pos = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+        if (onPolygonPointAddRef.current) onPolygonPointAddRef.current(pos);
+        else onFenceCenterChangeRef.current?.(pos);
+      });
     }
   }, [apiState, currentLocation, geoFence]);
 
@@ -395,6 +439,7 @@ function GoogleMapPanel({
     overlays.current.forEach((o) => o.setMap?.(null));
     overlays.current = [];
     circle.current?.setMap?.(null);
+    fencePolygon.current?.setMap?.(null);
     routeLine.current?.setMap?.(null);
 
     const addMarker = (position, label, titleText, color = "#2563eb", variant = "dot") => {
@@ -437,17 +482,54 @@ function GoogleMapPanel({
       overlays.current.push(marker);
     };
 
-    if (geoFence?.enabled && geoFence?.center) {
+    if (geoFence?.enabled && geoFence?.shape === "polygon" && geoFence.polygon?.length >= 2) {
+      fencePolygon.current = new window.google.maps.Polygon({
+        map: map.current,
+        paths: geoFence.polygon,
+        fillColor: "#2563eb",
+        fillOpacity: 0.14,
+        strokeColor: "#2563eb",
+        strokeOpacity: 0.9,
+        strokeWeight: 3,
+      });
+    } else if (geoFence?.enabled && geoFence?.shape !== "polygon" && isValidLatLng(geoFence?.center) && numberOr(geoFence.radiusM, 0) > 0) {
       circle.current = new window.google.maps.Circle({
         map: map.current,
         center: geoFence.center,
         radius: numberOr(geoFence.radiusM, 1000),
         fillColor: "#2563eb",
-        fillOpacity: 0.08,
+        fillOpacity: 0.14,
         strokeColor: "#2563eb",
-        strokeOpacity: 0.8,
-        strokeWeight: 2,
+        strokeOpacity: 0.9,
+        strokeWeight: 3,
       });
+    }
+
+    if (onPolygonPointAdd && Array.isArray(geoFence?.polygon)) {
+      geoFence.polygon.forEach((pt, idx) => addMarker(pt, String(idx + 1), `Point ${idx + 1}`, "#2563eb"));
+    }
+
+    if (onFenceCenterChange && geoFence?.shape !== "polygon" && isValidLatLng(geoFence?.center)) {
+      const centerMarker = new window.google.maps.Marker({
+        map: map.current,
+        position: geoFence.center,
+        draggable: true,
+        cursor: "move",
+        icon: {
+          path: window.google.maps.SymbolPath.CIRCLE,
+          scale: 9,
+          fillColor: "#2563eb",
+          fillOpacity: 1,
+          strokeColor: "#ffffff",
+          strokeWeight: 2,
+        },
+        title: "Drag to move the geo-fence center, or click anywhere on the map",
+        zIndex: 60,
+      });
+      centerMarker.addListener("dragend", (e) => {
+        onFenceCenterChangeRef.current?.({ lat: e.latLng.lat(), lng: e.latLng.lng() });
+      });
+      overlays.current.push(centerMarker);
     }
 
     if (pickupPoint)
@@ -482,9 +564,15 @@ function GoogleMapPanel({
     if (routeTarget?.lat && routeTarget?.lng) { bounds.extend(routeTarget); hasBounds = true; }
     if (hasBounds && routeStart && routeTarget) {
       map.current.fitBounds(bounds, 80);
+    } else if (circle.current) {
+      map.current.fitBounds(circle.current.getBounds(), 0);
+    } else if (fencePolygon.current) {
+      const polyBounds = new window.google.maps.LatLngBounds();
+      geoFence.polygon.forEach((p) => polyBounds.extend(p));
+      map.current.fitBounds(polyBounds, 30);
     } else {
       const focus = currentLocation || pickupPoint || destinationPoint || deliveryPoint || geoFence?.center;
-      if (focus?.lat && focus?.lng) {
+      if (isValidLatLng({ lat: Number(focus?.lat), lng: Number(focus?.lng) })) {
         map.current.panTo({ lat: Number(focus.lat), lng: Number(focus.lng) });
       }
     }
@@ -735,13 +823,16 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
     lat: db.settings.geoFence.center.lat,
     lng: db.settings.geoFence.center.lng,
   });
+  const [editingDropLocationId, setEditingDropLocationId] = useState(null);
   const [fenceForm, setFenceForm] = useState({
+    shape: db.settings.geoFence.shape || "circle",
     lat: db.settings.geoFence.center.lat,
     lng: db.settings.geoFence.center.lng,
     radiusM: db.settings.geoFence.radiusM,
     arrivalRadiusM: db.settings.geoFence.arrivalRadiusM,
     enabled: db.settings.geoFence.enabled,
   });
+  const [polygonPoints, setPolygonPoints] = useState(db.settings.geoFence.polygon || []);
   const importRef = useRef(null);
   const [adminLocation, setAdminLocation] = useState(null);
   const [locatingAdmin, setLocatingAdmin] = useState(false);
@@ -787,17 +878,31 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
     toast("success", "Fare saved", "New rides will use this fare from now on.");
   }
 
-  function addDropLocation(e) {
+  function saveDropLocation(e) {
     e.preventDefault();
-    if (db.dropLocations.length >= 9) {
-      toast("error", "Limit reached", "Only 9 drop locations can be configured. Delete one before adding another.");
-      return;
-    }
     const name = dropLocationForm.name.trim();
     const lat = Number(dropLocationForm.lat);
     const lng = Number(dropLocationForm.lng);
-    if (!name || !Number.isFinite(lat) || !Number.isFinite(lng)) {
-      toast("error", "Invalid location", "Enter a name, latitude and longitude.");
+    if (!name || !Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      toast("error", "Invalid location", "Enter a name, a valid latitude (-90 to 90) and a valid longitude (-180 to 180).");
+      return;
+    }
+    if (editingDropLocationId) {
+      setDb((prev) => appendEvent({
+        ...prev,
+        dropLocations: prev.dropLocations.map((d) => d.id === editingDropLocationId ? { ...d, name, lat, lng, updatedAt: nowISO() } : d),
+      }, {
+        type: "DROP_LOCATION_UPDATED",
+        actor: "Administrator",
+        message: `${name} was updated.`,
+      }));
+      setEditingDropLocationId(null);
+      setDropLocationForm({ name: "", lat, lng });
+      toast("success", "Drop location updated", `${name} was saved.`);
+      return;
+    }
+    if (db.dropLocations.length >= 10) {
+      toast("error", "Limit reached", "Only 10 drop locations can be configured. Delete one before adding another.");
       return;
     }
     const location = { id: uid("DROP"), name, lat, lng, createdAt: nowISO() };
@@ -811,15 +916,58 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
     toast("success", "Drop location added", `${location.name} is now available to users.`);
   }
 
+  function startEditDropLocation(d) {
+    setEditingDropLocationId(d.id);
+    setDropLocationForm({ name: d.name, lat: d.lat, lng: d.lng });
+  }
+
+  function cancelEditDropLocation() {
+    setEditingDropLocationId(null);
+    setDropLocationForm({ name: "", lat: db.settings.geoFence.center.lat, lng: db.settings.geoFence.center.lng });
+  }
+
   function removeDropLocation(id) {
     const d = db.dropLocations.find((x) => x.id === id);
     if (!window.confirm(`Delete ${d?.name || "this location"}?`)) return;
+    if (editingDropLocationId === id) cancelEditDropLocation();
     setDb((prev) => appendEvent({ ...prev, dropLocations: prev.dropLocations.filter((x) => x.id !== id) }, {
       type: "DROP_LOCATION_DELETED",
       level: "warning",
       actor: "Administrator",
       message: `${d?.name || "Drop location"} was deleted.`,
     }));
+  }
+
+  function removeRide(id) {
+    const r = db.rides.find((x) => x.id === id);
+    if (!window.confirm(`Delete trip ${r?.id || id}? This also removes its payment and location records.`)) return;
+    setDb((prev) => appendEvent({
+      ...prev,
+      rides: prev.rides.filter((x) => x.id !== id),
+      payments: prev.payments.filter((p) => p.rideId !== id),
+      locationSamples: prev.locationSamples.filter((s) => s.rideId !== id),
+    }, {
+      type: "TRIP_DELETED",
+      level: "warning",
+      actor: "Administrator",
+      message: `Trip ${r?.id || id} and its related records were deleted.`,
+    }));
+  }
+
+  function removePayment(id) {
+    const p = db.payments.find((x) => x.id === id);
+    if (!window.confirm(`Delete payment record ${p?.id || id}?`)) return;
+    setDb((prev) => appendEvent({ ...prev, payments: prev.payments.filter((x) => x.id !== id) }, {
+      type: "PAYMENT_DELETED",
+      level: "warning",
+      actor: "Administrator",
+      message: `Payment record ${p?.id || id} was deleted.`,
+    }));
+  }
+
+  function removeEvent(id) {
+    if (!window.confirm("Delete this event log entry?")) return;
+    setDb((prev) => ({ ...prev, events: prev.events.filter((x) => x.id !== id) }));
   }
 
   async function useAdminLocationForDropLocation() {
@@ -832,22 +980,59 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
     }
   }
 
+  function addPolygonPoint(pos) {
+    setPolygonPoints((pts) => [...pts, pos]);
+  }
+
+  function undoPolygonPoint() {
+    setPolygonPoints((pts) => pts.slice(0, -1));
+  }
+
+  function clearPolygonPoints() {
+    setPolygonPoints([]);
+  }
+
   function saveFence(e) {
     e.preventDefault();
-    const geoFence = {
-      center: { lat: Number(fenceForm.lat), lng: Number(fenceForm.lng) },
-      radiusM: clamp(Number(fenceForm.radiusM), 20, 100000),
-      arrivalRadiusM: clamp(Number(fenceForm.arrivalRadiusM), 10, 2000),
-      enabled: Boolean(fenceForm.enabled),
-    };
-    if (!Number.isFinite(geoFence.center.lat) || !Number.isFinite(geoFence.center.lng)) {
-      toast("error", "Invalid geo-fence", "Enter valid latitude and longitude.");
+    const shape = fenceForm.shape === "polygon" ? "polygon" : "circle";
+    const arrivalRadiusM = clamp(Number(fenceForm.arrivalRadiusM), 10, 2000);
+    const enabled = Boolean(fenceForm.enabled);
+
+    if (shape === "polygon") {
+      if (polygonPoints.length < 3) {
+        toast("error", "Not enough points", "Click at least 3 points on the map to draw a boundary shape.");
+        return;
+      }
+      const center = {
+        lat: polygonPoints.reduce((s, p) => s + p.lat, 0) / polygonPoints.length,
+        lng: polygonPoints.reduce((s, p) => s + p.lng, 0) / polygonPoints.length,
+      };
+      const geoFence = { shape, polygon: polygonPoints, center, radiusM: db.settings.geoFence.radiusM, arrivalRadiusM, enabled };
+      setDb((prev) => appendEvent({ ...prev, settings: { ...prev.settings, geoFence } }, {
+        type: "GEOFENCE_UPDATED",
+        actor: "Administrator",
+        message: `Geo-fence updated: custom boundary with ${polygonPoints.length} points; arrival radius ${arrivalRadiusM} m.`,
+        data: geoFence,
+      }));
+      toast("success", "Geo-fence saved", "All new live GPS updates will use this custom boundary shape.");
       return;
     }
+
+    const center = { lat: Number(fenceForm.lat), lng: Number(fenceForm.lng) };
+    const radiusM = clamp(Number(fenceForm.radiusM), 20, 100000);
+    if (
+      !Number.isFinite(center.lat) || !Number.isFinite(center.lng) ||
+      center.lat < -90 || center.lat > 90 ||
+      center.lng < -180 || center.lng > 180
+    ) {
+      toast("error", "Invalid geo-fence", "Enter a valid latitude (-90 to 90) and longitude (-180 to 180).");
+      return;
+    }
+    const geoFence = { shape, center, radiusM, polygon: db.settings.geoFence.polygon || [], arrivalRadiusM, enabled };
     setDb((prev) => appendEvent({ ...prev, settings: { ...prev.settings, geoFence } }, {
       type: "GEOFENCE_UPDATED",
       actor: "Administrator",
-      message: `Geo-fence updated: ${geoFence.radiusM} m radius; arrival radius ${geoFence.arrivalRadiusM} m.`,
+      message: `Geo-fence updated: ${radiusM} m radius; arrival radius ${arrivalRadiusM} m.`,
       data: geoFence,
     }));
     toast("success", "Geo-fence saved", "All new live GPS updates will use this boundary.");
@@ -1077,25 +1262,29 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
 
           {tab === "dropLocations" ? (
             <>
-              <SectionHeader title="Drop Locations" subtitle="Configure up to 9 quick-pick delivery locations. Users can also choose Other and enter a custom address." />
+              <SectionHeader title="Drop Locations" subtitle="Configure up to 10 quick-pick delivery locations. Users can also choose Other and enter a custom address." />
               <div className="grid-main-side reverse-mobile">
                 <div className="card">
-                  <h3>Configured Locations ({db.dropLocations.length}/9)</h3>
+                  <h3>Configured Locations ({db.dropLocations.length}/10)</h3>
                   {db.dropLocations.length ? <div className="destination-list">
                     {db.dropLocations.map((d) => (
-                      <div className="destination-row" key={d.id}>
+                      <div className={`destination-row ${editingDropLocationId===d.id?"selected":""}`} key={d.id}>
                         <div className="destination-info"><b>{d.name}</b><span>{Number(d.lat).toFixed(6)}, {Number(d.lng).toFixed(6)}</span></div>
-                        <div className="destination-actions"><button className="mini danger-outline" onClick={() => removeDropLocation(d.id)}>Delete</button></div>
+                        <div className="destination-actions"><button className="mini primary" onClick={() => startEditDropLocation(d)}>Edit</button><button className="mini danger-outline" onClick={() => removeDropLocation(d.id)}>Delete</button></div>
                       </div>
                     ))}
                   </div> : <Empty text="No drop locations configured yet." />}
                 </div>
-                <form className="card" onSubmit={addDropLocation}>
-                  <h3>Add Drop Location</h3>
+                <form className="card" onSubmit={saveDropLocation}>
+                  <h3>{editingDropLocationId ? "Edit Drop Location" : "Add Drop Location"}</h3>
                   <Field label="Location name"><input value={dropLocationForm.name} onChange={(e)=>setDropLocationForm(f=>({...f,name:e.target.value}))} placeholder="e.g. Main Gate" /></Field>
                   <div className="grid-2"><Field label="Latitude"><input type="number" step="any" value={dropLocationForm.lat} onChange={(e)=>setDropLocationForm(f=>({...f,lat:e.target.value}))} /></Field><Field label="Longitude"><input type="number" step="any" value={dropLocationForm.lng} onChange={(e)=>setDropLocationForm(f=>({...f,lng:e.target.value}))} /></Field></div>
                   <button type="button" className="ghost wide" onClick={useAdminLocationForDropLocation}>Use My Current GPS Coordinates</button>
-                  <button className="primary wide top-gap-sm" disabled={db.dropLocations.length >= 9}>{db.dropLocations.length >= 9 ? "Limit Reached (9/9)" : "Add Drop Location"}</button>
+                  {editingDropLocationId ? (
+                    <div className="button-row top-gap-sm"><button type="button" className="ghost" onClick={cancelEditDropLocation}>Cancel</button><button className="primary">Save Changes</button></div>
+                  ) : (
+                    <button className="primary wide top-gap-sm" disabled={db.dropLocations.length >= 10}>{db.dropLocations.length >= 10 ? "Limit Reached (10/10)" : "Add Drop Location"}</button>
+                  )}
                 </form>
               </div>
             </>
@@ -1103,16 +1292,41 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
 
           {tab === "geofence" ? (
             <>
-              <SectionHeader title="Geo-Fence Configuration" subtitle="The simulated vehicle will be disabled when a tracked user exits this permitted radius." />
+              <SectionHeader title="Geo-Fence Configuration" subtitle={fenceForm.shape === "polygon" ? "Click on the map to place each corner of a custom boundary shape, in order." : "Click anywhere on the map, or drag the blue center marker, to choose the boundary location."} />
               <div className="grid-main-side reverse-mobile">
-                <GoogleMapPanel geoFence={{...db.settings.geoFence, center:{lat:Number(fenceForm.lat),lng:Number(fenceForm.lng)}, radiusM:Number(fenceForm.radiusM), enabled:fenceForm.enabled}} height={540} />
+                <GoogleMapPanel
+                  geoFence={fenceForm.shape === "polygon"
+                    ? { ...db.settings.geoFence, shape: "polygon", polygon: polygonPoints, enabled: fenceForm.enabled }
+                    : { ...db.settings.geoFence, shape: "circle", center: { lat: Number(fenceForm.lat), lng: Number(fenceForm.lng) }, radiusM: Number(fenceForm.radiusM), enabled: fenceForm.enabled }}
+                  onFenceCenterChange={fenceForm.shape === "polygon" ? undefined : (pos) => setFenceForm(f => ({ ...f, lat: pos.lat, lng: pos.lng }))}
+                  onPolygonPointAdd={fenceForm.shape === "polygon" ? addPolygonPoint : undefined}
+                  height={540}
+                />
                 <form className="card" onSubmit={saveFence}>
                   <h3>Operating Boundary</h3>
-                  <div className="grid-2"><Field label="Center latitude"><input type="number" step="any" value={fenceForm.lat} onChange={(e)=>setFenceForm(f=>({...f,lat:e.target.value}))}/></Field><Field label="Center longitude"><input type="number" step="any" value={fenceForm.lng} onChange={(e)=>setFenceForm(f=>({...f,lng:e.target.value}))}/></Field></div>
-                  <Field label="Permitted radius (meters)" hint="Vehicle is allowed only inside this circle."><input type="number" min="20" value={fenceForm.radiusM} onChange={(e)=>setFenceForm(f=>({...f,radiusM:e.target.value}))}/></Field>
+                  <div className="role-switch">
+                    <button type="button" className={fenceForm.shape !== "polygon" ? "active" : ""} onClick={() => setFenceForm(f => ({ ...f, shape: "circle" }))}>Circle</button>
+                    <button type="button" className={fenceForm.shape === "polygon" ? "active" : ""} onClick={() => setFenceForm(f => ({ ...f, shape: "polygon" }))}>Custom Boundary</button>
+                  </div>
+                  {fenceForm.shape === "polygon" ? (
+                    <>
+                      <p className="muted">Click on the map to add corner points ({polygonPoints.length} placed, minimum 3 needed).</p>
+                      <div className="button-row">
+                        <button type="button" className="ghost" onClick={undoPolygonPoint} disabled={!polygonPoints.length}>Undo Last Point</button>
+                        <button type="button" className="danger-outline" onClick={clearPolygonPoints} disabled={!polygonPoints.length}>Clear Points</button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="muted">Click on the map or drag the center marker to pick a location — the coordinates below update automatically.</p>
+                      <div className="grid-2"><Field label="Center latitude"><input type="number" step="any" value={fenceForm.lat} onChange={(e)=>setFenceForm(f=>({...f,lat:e.target.value}))}/></Field><Field label="Center longitude"><input type="number" step="any" value={fenceForm.lng} onChange={(e)=>setFenceForm(f=>({...f,lng:e.target.value}))}/></Field></div>
+                      {!isValidLatLng({ lat: Number(fenceForm.lat), lng: Number(fenceForm.lng) }) ? <p className="field-error">Latitude must be -90 to 90 and longitude -180 to 180 — fix this before the boundary can be shown or saved.</p> : null}
+                      <Field label="Permitted radius (meters)" hint="Vehicle is allowed only inside this circle."><input type="number" min="20" value={fenceForm.radiusM} onChange={(e)=>setFenceForm(f=>({...f,radiusM:e.target.value}))}/></Field>
+                      <button type="button" className="ghost wide" onClick={useAdminLocationForFence}>Use My Current GPS as Center</button>
+                    </>
+                  )}
                   <Field label="Destination arrival radius (meters)" hint="Trip completes automatically when the user enters this radius around the selected destination."><input type="number" min="10" value={fenceForm.arrivalRadiusM} onChange={(e)=>setFenceForm(f=>({...f,arrivalRadiusM:e.target.value}))}/></Field>
                   <label className="toggle-line"><input type="checkbox" checked={fenceForm.enabled} onChange={(e)=>setFenceForm(f=>({...f,enabled:e.target.checked}))}/><span>Geo-fence enforcement enabled</span></label>
-                  <button type="button" className="ghost wide" onClick={useAdminLocationForFence}>Use My Current GPS as Center</button>
                   <button className="primary wide top-gap-sm">Save Geo-Fence</button>
                 </form>
               </div>
@@ -1134,8 +1348,8 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
             <>
               <SectionHeader title="Trip History" subtitle="Complete travel details including authentication, selected destination, payment and timing." />
               <div className="card">
-                {db.rides.length ? <div className="table-wrap"><table><thead><tr><th>Trip ID</th><th>User</th><th>Destination</th><th>Amount</th><th>OTP</th><th>Payment</th><th>Geo</th><th>Start</th><th>End</th><th>Status</th><th>Reached</th><th>Driver</th></tr></thead><tbody>
-                  {db.rides.map((r)=><tr key={r.id}><td>{r.id}</td><td>{r.userName}<br/><small>{r.mobile}</small></td><td>{r.destinationName}</td><td>{money(r.amount)}</td><td><Badge>{r.otpVerified ? "VERIFIED" : r.otp ? "GENERATED" : "WAITING"}</Badge></td><td><Badge>{r.paymentStatus || "PENDING"}</Badge></td><td><Badge>{r.geoStatus || "UNKNOWN"}</Badge></td><td>{formatDate(r.startTime)}</td><td>{formatDate(r.endTime)}</td><td><Badge>{r.tripStatus}</Badge></td><td>{r.reachedStatus?<Badge tone={r.reachedStatus==="REACHED"?"good":"bad"}>{r.reachedStatus==="REACHED"?"Reached":"Not Reached"}</Badge>:"—"}</td><td>{r.driverRating?<Badge tone={r.driverRating==="GOOD"?"good":"bad"}>{r.driverRating}</Badge>:"—"}</td></tr>)}
+                {db.rides.length ? <div className="table-wrap"><table><thead><tr><th>Trip ID</th><th>User</th><th>Destination</th><th>Amount</th><th>OTP</th><th>Payment</th><th>Geo</th><th>Start</th><th>End</th><th>Status</th><th>Reached</th><th>Driver</th><th>Actions</th></tr></thead><tbody>
+                  {db.rides.map((r)=><tr key={r.id}><td>{r.id}</td><td>{r.userName}<br/><small>{r.mobile}</small></td><td>{r.destinationName}</td><td>{money(r.amount)}</td><td><Badge>{r.otpVerified ? "VERIFIED" : r.otp ? "GENERATED" : "WAITING"}</Badge></td><td><Badge>{r.paymentStatus || "PENDING"}</Badge></td><td><Badge>{r.geoStatus || "UNKNOWN"}</Badge></td><td>{formatDate(r.startTime)}</td><td>{formatDate(r.endTime)}</td><td><Badge>{r.tripStatus}</Badge></td><td>{r.reachedStatus?<Badge tone={r.reachedStatus==="REACHED"?"good":"bad"}>{r.reachedStatus==="REACHED"?"Reached":"Not Reached"}</Badge>:"—"}</td><td>{r.driverRating?<Badge tone={r.driverRating==="GOOD"?"good":"bad"}>{r.driverRating}</Badge>:"—"}</td><td><button className="mini danger-outline" onClick={()=>removeRide(r.id)}>Delete</button></td></tr>)}
                 </tbody></table></div> : <Empty text="No trip records are stored yet." />}
               </div>
             </>
@@ -1146,8 +1360,8 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
               <SectionHeader title="Dummy Payment Records" subtitle="Prototype transactions only — no real banking or gateway request is performed." />
               <div className="metrics-grid compact-metrics"><Metric icon="₹" label="Successful Amount" value={money(paidTotal)} /><Metric icon="✓" label="Successful" value={db.payments.filter((p)=>p.status==="SUCCESS").length} /><Metric icon="…" label="Pending" value={db.payments.filter((p)=>p.status==="PENDING").length} /><Metric icon="×" label="Failed" value={db.payments.filter((p)=>p.status==="FAILED").length} /></div>
               <div className="card">
-                {db.payments.length ? <div className="table-wrap"><table><thead><tr><th>Payment ID</th><th>Trip</th><th>User</th><th>Destination</th><th>Method</th><th>Amount</th><th>Status</th><th>Reference</th><th>Time</th></tr></thead><tbody>
-                  {db.payments.map((p)=><tr key={p.id}><td>{p.id}</td><td>{p.rideId}</td><td>{p.userName}</td><td>{p.destinationName}</td><td>{p.method}</td><td>{money(p.amount)}</td><td><Badge>{p.status}</Badge></td><td>{p.reference}</td><td>{formatDate(p.at)}</td></tr>)}
+                {db.payments.length ? <div className="table-wrap"><table><thead><tr><th>Payment ID</th><th>Trip</th><th>User</th><th>Destination</th><th>Method</th><th>Amount</th><th>Status</th><th>Reference</th><th>Time</th><th>Actions</th></tr></thead><tbody>
+                  {db.payments.map((p)=><tr key={p.id}><td>{p.id}</td><td>{p.rideId}</td><td>{p.userName}</td><td>{p.destinationName}</td><td>{p.method}</td><td>{money(p.amount)}</td><td><Badge>{p.status}</Badge></td><td>{p.reference}</td><td>{formatDate(p.at)}</td><td><button className="mini danger-outline" onClick={()=>removePayment(p.id)}>Delete</button></td></tr>)}
                 </tbody></table></div> : <Empty text="No payment records yet." />}
               </div>
             </>
@@ -1158,7 +1372,7 @@ function AdminDashboard({ db, setDb, session, logout, toast }) {
               <SectionHeader title="Event History" subtitle="Every major user, OTP, payment, trip, location and geo-fence event is retained locally." />
               <div className="card">
                 <div className="timeline">
-                  {db.events.map((e)=><div key={e.id} className="timeline-item"><span className={`event-dot ${e.level}`}/><div><div className="timeline-title"><b>{e.type}</b><Badge tone={e.level === "error" ? "bad" : e.level === "warning" ? "warn" : "neutral"}>{e.actor}</Badge></div><p>{e.message}</p><small>{formatDate(e.at)} • {e.id}</small></div></div>)}
+                  {db.events.map((e)=><div key={e.id} className="timeline-item"><span className={`event-dot ${e.level}`}/><div><div className="timeline-title"><b>{e.type}</b><span style={{display:"flex",alignItems:"center",gap:"8px"}}><Badge tone={e.level === "error" ? "bad" : e.level === "warning" ? "warn" : "neutral"}>{e.actor}</Badge><button className="mini danger-outline" onClick={()=>removeEvent(e.id)}>Delete</button></span></div><p>{e.message}</p><small>{formatDate(e.at)} • {e.id}</small></div></div>)}
                 </div>
               </div>
             </>
@@ -1282,7 +1496,7 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
   const destinationPoint = currentRide && currentRide.destinationLat != null && currentRide.destinationLng != null ? { lat: Number(currentRide.destinationLat), lng: Number(currentRide.destinationLng) } : null;
   const pickupPoint = currentRide && currentRide.pickupLat != null && currentRide.pickupLng != null ? { lat: Number(currentRide.pickupLat), lng: Number(currentRide.pickupLng) } : null;
   const deliveryPoint = user?.deliveryLat != null && user?.deliveryLng != null ? { lat: Number(user.deliveryLat), lng: Number(user.deliveryLng) } : null;
-  const insideFence = currentLocation ? distanceMeters(currentLocation, db.settings.geoFence.center) <= Number(db.settings.geoFence.radiusM) : null;
+  const insideFence = currentLocation ? isInsideGeoFence(currentLocation, db.settings.geoFence) : null;
   const distanceToDestination = currentLocation && destinationPoint ? distanceMeters(currentLocation, destinationPoint) : null;
   const bookingPickupPreview = bookingForm && bookingForm.pickupLat !== "" && bookingForm.pickupLng !== "" && Number.isFinite(Number(bookingForm.pickupLat)) && Number.isFinite(Number(bookingForm.pickupLng)) ? { lat: Number(bookingForm.pickupLat), lng: Number(bookingForm.pickupLng) } : null;
   const bookingDeliveryPreview = bookingForm && bookingForm.deliveryLat !== "" && bookingForm.deliveryLng !== "" && Number.isFinite(Number(bookingForm.deliveryLat)) && Number.isFinite(Number(bookingForm.deliveryLng)) ? { lat: Number(bookingForm.deliveryLat), lng: Number(bookingForm.deliveryLng) } : null;
@@ -1379,7 +1593,7 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
     setDb((prev) => {
       const u = prev.users.find((x) => x.id === session.userId);
       const fence = prev.settings.geoFence;
-      const inFence = !fence.enabled || distanceMeters(coords, fence.center) <= Number(fence.radiusM);
+      const inFence = isInsideGeoFence(coords, fence);
       let rides = [...prev.rides];
       let vehicle = { ...prev.vehicle };
       let eventMessages = [];
@@ -1399,13 +1613,20 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
         ride.distanceToDestinationM = Number.isFinite(destDistance) ? Math.round(destDistance) : null;
 
         if (!inFence) {
-          if (ride.vehicleEnabled || ride.tripStatus !== "VEHICLE DISABLED") {
-            eventMessages.push({ level: "error", type: "GEOFENCE_EXIT", message: `User moved outside the permitted geo-fence. Vehicle disabled automatically.` });
+          if (!ride.motorLocked) {
+            eventMessages.push({ level: "error", type: "VEHICLE_LOCKED", message: `User moved outside the permitted geo-fence. Vehicle motor locked — re-verify OTP to resume.` });
           }
           ride.vehicleEnabled = false;
-          ride.tripStatus = "VEHICLE DISABLED";
+          ride.motorLocked = true;
+          ride.otp = null;
+          ride.otpVerified = false;
+          ride.otpGeneratedAt = null;
+          ride.tripStatus = "VEHICLE LOCKED";
           ride.locationStatus = "OUTSIDE GEO-FENCE";
-          vehicle = { ...vehicle, motorCommand: "OFF", lastCommandAt: coords.at, lastCommandReason: "Outside geo-fence" };
+          vehicle = { ...vehicle, motorCommand: "OFF", lastCommandAt: coords.at, lastCommandReason: "Outside geo-fence — motor locked" };
+        } else if (ride.motorLocked) {
+          ride.tripStatus = "VEHICLE LOCKED";
+          ride.locationStatus = "LOCKED — VERIFY OTP TO RESUME";
         } else if (dest && destDistance <= Number(fence.arrivalRadiusM)) {
           if (ride.tripStatus !== "TRIP COMPLETED") eventMessages.push({ level: "info", type: "DESTINATION_REACHED", message: `${dest.name} reached. Vehicle disabled and trip completed.` });
           ride.vehicleEnabled = false;
@@ -1597,11 +1818,19 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
       return;
     }
     pushEmergencyUpdate({ Emergency: 0 });
+    const wasLocked = currentRide.motorLocked;
     setDb((prev) => {
-      const rides = prev.rides.map((r) => r.id === currentRide.id ? { ...r, otpVerified: true, otpVerifiedAt: nowISO(), tripStatus: "OTP VERIFIED", locationStatus: "DESTINATION SELECTED" } : r);
-      return appendEvent({ ...prev, rides }, { type: "OTP_VERIFIED", actor: user.name, message: `OTP verified for ${currentRide.id}.` });
+      const rides = prev.rides.map((r) => r.id === currentRide.id ? {
+        ...r,
+        otpVerified: true,
+        otpVerifiedAt: nowISO(),
+        motorLocked: false,
+        tripStatus: "OTP VERIFIED",
+        locationStatus: wasLocked ? "AWAITING GPS CONFIRMATION" : "DESTINATION SELECTED",
+      } : r);
+      return appendEvent({ ...prev, rides }, { type: wasLocked ? "VEHICLE_UNLOCKED" : "OTP_VERIFIED", actor: user.name, message: wasLocked ? `Vehicle unlocked after re-verification for ${currentRide.id}.` : `OTP verified for ${currentRide.id}.` });
     });
-    toast("success", "OTP verified", "Authentication successful. You can proceed to dummy payment.");
+    toast("success", wasLocked ? "Vehicle unlocked" : "OTP verified", wasLocked ? "Re-authentication successful. The motor will re-enable once GPS confirms you are back inside the geo-fence." : "Authentication successful. You can proceed to dummy payment.");
   }
 
   function completePayment(method, methodForm) {
@@ -1624,7 +1853,7 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
       const fence = prev.settings.geoFence;
       const latest = prev.locationSamples.find((s) => s.userId === user.id);
       const loc = latest ? { lat: Number(latest.lat), lng: Number(latest.lng) } : null;
-      const inFence = !fence.enabled || (loc && distanceMeters(loc, fence.center) <= Number(fence.radiusM));
+      const inFence = isInsideGeoFence(loc, fence);
       const rides = prev.rides.map((r) => r.id === paymentRide.id ? {
         ...r,
         paymentStatus: "SUCCESS",
@@ -1792,11 +2021,12 @@ function UserDashboard({ db, setDb, session, logout, toast, dbLoaded }) {
               {!currentRide ? <div className="card"><Empty text="No active trip. Open Dashboard and book a ride with pickup and delivery coordinates."/><button className="primary center-btn" onClick={()=>setTab("home")}>Book a Ride</button></div> : (
                 <>
                   <div className="ride-hero card"><div><span className="stop-number large">⌖</span></div><div className="ride-destination"><div className="eyebrow">DELIVERY DESTINATION</div><h2>{currentRide.destinationName}</h2><p>Pickup: {Number(currentRide.pickupLat).toFixed(6)}, {Number(currentRide.pickupLng).toFixed(6)}</p><p>Delivery: {Number(currentRide.destinationLat).toFixed(6)}, {Number(currentRide.destinationLng).toFixed(6)}</p><p>{currentRide.distanceKm} km</p></div><div className="ride-price"><span>Ride amount</span><b>{money(currentRide.amount)}</b></div></div>
+                  {currentRide.motorLocked ? <div className="geo-alert bad"><b>⚠ Vehicle Locked — Outside Geo-Fence</b><span>The motor was locked automatically because you left the permitted area. Generate and verify a new OTP below to unlock it.</span></div> : null}
                   <div className="workflow-grid">
-                    <div className={`workflow-card ${currentRide.otp?"done":"active"}`}><span className="step">1</span><h3>Generate OTP</h3><p>Simulates OTP displayed in the registered user web application. Valid for 30 seconds.</p>{currentRide.otp?<><div className="otp-display">{currentRide.otp}</div>{!currentRide.otpVerified?<small>Expires in {otpSecondsLeft}s</small>:null}</>:<button className="primary wide" onClick={generateOtp}>Generate OTP</button>}</div>
-                    <div className={`workflow-card ${currentRide.otpVerified?"done":currentRide.otp?"active":""}`}><span className="step">2</span><h3>Verify OTP</h3><p>Enter the same OTP to simulate the vehicle keypad authentication.</p><input className="otp-input" inputMode="numeric" maxLength="6" value={otpInput} onChange={(e)=>setOtpInput(e.target.value.replace(/\D/g,""))} placeholder="000000"/><button className="primary wide" disabled={!currentRide.otp||currentRide.otpVerified} onClick={verifyOtp}>{currentRide.otpVerified?"OTP Verified ✓":"Verify OTP"}</button></div>
+                    <div className={`workflow-card ${currentRide.otp?"done":"active"}`}><span className="step">1</span><h3>Generate OTP</h3><p>Simulates OTP displayed in the registered user web application. Valid for 30 seconds.</p>{currentRide.otp?<><div className="otp-display">{currentRide.otp}</div>{!currentRide.otpVerified?<small>Expires in {otpSecondsLeft}s</small>:null}</>:<button className="primary wide" onClick={generateOtp}>{currentRide.motorLocked?"Generate Unlock OTP":"Generate OTP"}</button>}</div>
+                    <div className={`workflow-card ${currentRide.otpVerified&&!currentRide.motorLocked?"done":currentRide.otp?"active":""}`}><span className="step">2</span><h3>Verify OTP</h3><p>Enter the same OTP to simulate the vehicle keypad authentication.</p><input className="otp-input" inputMode="numeric" maxLength="6" value={otpInput} onChange={(e)=>setOtpInput(e.target.value.replace(/\D/g,""))} placeholder="000000"/><button className="primary wide" disabled={!currentRide.otp||(currentRide.otpVerified&&!currentRide.motorLocked)} onClick={verifyOtp}>{currentRide.otpVerified&&!currentRide.motorLocked?"OTP Verified ✓":"Verify OTP"}</button></div>
                     <div className={`workflow-card ${currentRide.paymentStatus==="SUCCESS"?"done":currentRide.otpVerified?"active":""}`}><span className="step">3</span><h3>Dummy Payment</h3><p>Select wallet, net banking, UPI or card. No real payment is made.</p><div className="workflow-amount">{money(currentRide.amount)}</div><button className="primary wide" disabled={!currentRide.otpVerified||currentRide.paymentStatus==="SUCCESS"} onClick={()=>setPaymentRide(currentRide)}>{currentRide.paymentStatus==="SUCCESS"?`Paid via ${currentRide.paymentMethod} ✓`:"Pay Now"}</button></div>
-                    <div className={`workflow-card ${currentRide.startTime?"done":currentRide.paymentStatus==="SUCCESS"?"active":""}`}><span className="step">4</span><h3>Start Ride</h3><p>Requires verified OTP, successful payment and current location inside geo-fence.</p><div className="workflow-status"><Badge>{currentRide.geoStatus||"GPS REQUIRED"}</Badge><Badge>{currentRide.vehicleEnabled?"VEHICLE ENABLED":"VEHICLE DISABLED"}</Badge></div><button className="success wide" disabled={Boolean(currentRide.startTime)} onClick={startRide}>{currentRide.startTime?"Ride Running ✓":"Start Ride"}</button></div>
+                    <div className={`workflow-card ${currentRide.startTime&&!currentRide.motorLocked?"done":currentRide.paymentStatus==="SUCCESS"?"active":""}`}><span className="step">4</span><h3>Start Ride</h3><p>Requires verified OTP, successful payment and current location inside geo-fence.</p><div className="workflow-status"><Badge>{currentRide.geoStatus||"GPS REQUIRED"}</Badge><Badge tone={currentRide.motorLocked?"bad":undefined}>{currentRide.motorLocked?"VEHICLE LOCKED":currentRide.vehicleEnabled?"VEHICLE ENABLED":"VEHICLE DISABLED"}</Badge></div><button className="success wide" disabled={Boolean(currentRide.startTime)} onClick={startRide}>{currentRide.motorLocked?"Locked — Verify OTP":currentRide.startTime?"Ride Running ✓":"Start Ride"}</button></div>
                   </div>
                   <div className="grid-main-side top-gap">
                     <GoogleMapPanel geoFence={db.settings.geoFence} currentLocation={currentLocation} pickupPoint={pickupPoint} destinationPoint={destinationPoint} deliveryPoint={deliveryPoint} height={470}/>
@@ -1942,8 +2172,8 @@ export default function App() {
 }
 
 const styles = String.raw`
-*{box-sizing:border-box}html,body,#root{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f4f7fb}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}body{overflow-x:hidden}.auth-shell{min-height:100vh;display:grid;grid-template-columns:1.08fr .92fr;background:#eef3fb}.auth-brand-panel{padding:7vh 7vw;display:flex;flex-direction:column;justify-content:center;background:radial-gradient(circle at 20% 20%,rgba(59,130,246,.22),transparent 28%),linear-gradient(145deg,#07142d,#0c2853 55%,#164e63);color:white;position:relative;overflow:hidden}.auth-brand-panel:after{content:"";position:absolute;width:420px;height:420px;border:1px solid rgba(255,255,255,.08);border-radius:50%;right:-160px;bottom:-160px;box-shadow:0 0 0 60px rgba(255,255,255,.025),0 0 0 120px rgba(255,255,255,.02)}.logo{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#2563eb,#06b6d4);color:white;font-weight:900;box-shadow:0 10px 24px rgba(37,99,235,.28)}.logo.big{width:68px;height:68px;border-radius:21px;font-size:22px;margin-bottom:28px}.eyebrow{font-size:11px;letter-spacing:.16em;font-weight:800;color:#5f718c}.auth-brand-panel .eyebrow{color:#8dd6ff}.auth-brand-panel h1{font-size:clamp(38px,5vw,68px);line-height:1.02;max-width:760px;margin:14px 0 22px;letter-spacing:-.045em}.auth-brand-panel>p{font-size:17px;line-height:1.75;color:#c4d5eb;max-width:720px}.auth-feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:28px;max-width:700px}.auth-feature-grid div{padding:15px 16px;border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.06);border-radius:15px;font-weight:700;color:#e8f1ff}.local-note{margin-top:32px;display:flex;flex-direction:column;gap:5px;padding-left:15px;border-left:3px solid #38bdf8;color:#cfe6ff}.local-note strong{color:white}.auth-form-panel{display:grid;place-items:center;padding:36px}.auth-card{background:white;border-radius:26px;padding:34px;width:min(610px,100%);box-shadow:0 26px 70px rgba(15,23,42,.12);max-height:92vh;overflow:auto}.role-switch{display:grid;grid-template-columns:1fr 1fr;background:#eef2f8;border-radius:13px;padding:5px;margin-bottom:25px}.role-switch button{border:0;background:transparent;border-radius:10px;padding:11px;font-weight:800;color:#667085}.role-switch button.active{background:white;color:#1d4ed8;box-shadow:0 3px 14px rgba(15,23,42,.08)}.auth-title h2{font-size:28px;margin:0 0 8px}.auth-title p{color:#718096;margin:0 0 24px;line-height:1.55}.field{display:flex;flex-direction:column;gap:7px;margin-bottom:15px}.field>span{font-size:12px;font-weight:800;color:#40516b}.field small{font-size:11px;color:#8794a8}.field input,.field textarea,.field select,.otp-input{width:100%;border:1px solid #dce3ed;border-radius:11px;padding:12px 13px;outline:none;background:#fbfcfe;color:#172033;transition:.18s}.field textarea{min-height:72px;resize:vertical}.field input:focus,.field textarea:focus,.field select:focus,.otp-input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.1);background:white}.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:13px}.primary,.success,.danger,.ghost,.danger-outline{border:0;border-radius:11px;padding:11px 15px;font-weight:800;transition:.15s}.primary{background:#2563eb;color:white;box-shadow:0 8px 18px rgba(37,99,235,.18)}.primary:hover{background:#1d4ed8}.success{background:#159447;color:white}.danger{background:#dc2626;color:white}.ghost{background:#eef3fa;color:#34445d}.danger-outline{background:#fff1f2;color:#be123c;border:1px solid #fecdd3}.wide{width:100%}.text-btn{border:0;background:transparent;color:#2563eb;font-weight:800;width:100%;margin-top:14px}.demo-creds{font-size:12px;color:#6b7280;background:#f8fafc;padding:10px;border-radius:9px;margin-bottom:15px}.app-shell{min-height:100vh}.sidebar{position:fixed;left:0;top:0;width:246px;height:100vh;background:#0d1b33;color:#c9d5e8;padding:19px 14px;display:flex;flex-direction:column;overflow-y:auto;z-index:20}.brand-row{display:flex;gap:11px;align-items:center;padding:4px 8px 17px;border-bottom:1px solid rgba(255,255,255,.08)}.brand-row>div:last-child{display:flex;flex-direction:column}.brand-row b{font-size:15px;color:white}.brand-row span{font-size:10px;color:#7387a9}.sidebar-role{display:flex;flex-direction:column;gap:4px;padding:20px 10px 10px}.sidebar-role>span{font-size:9px;letter-spacing:.15em;color:#6d82a7;font-weight:900}.sidebar-role b{font-size:13px;color:white}.sidebar-role small{font-size:11px;color:#8ea0bd}.sidebar nav{display:flex;flex-direction:column;gap:4px;margin-top:7px}.sidebar nav button{border:0;background:transparent;color:#93a6c4;padding:10px 11px;border-radius:10px;text-align:left;display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700}.sidebar nav button i{font-style:normal;width:19px;text-align:center;font-size:16px}.sidebar nav button.active,.sidebar nav button:hover{background:#193255;color:white}.sidebar nav button.active{box-shadow:inset 3px 0 #38bdf8}.sidebar-bottom{margin-top:auto;border-top:1px solid rgba(255,255,255,.08);padding-top:15px}.hardware-mini{display:flex;gap:9px;align-items:center;padding:8px}.hardware-mini>div{display:flex;flex-direction:column}.hardware-mini b{font-size:11px;color:white}.hardware-mini small{font-size:10px;color:#7184a5}.dot{width:9px;height:9px;border-radius:50%;background:#94a3b8;box-shadow:0 0 0 4px rgba(148,163,184,.12)}.dot.good{background:#22c55e}.dot.warn{background:#f59e0b}.dot.bad{background:#ef4444}.logout{margin-top:7px;width:100%;border:0;background:rgba(255,255,255,.05);color:#9fb0c9;border-radius:10px;padding:10px;font-weight:700}.main{min-width:0;margin-left:246px}.topbar{height:78px;background:white;border-bottom:1px solid #e9eef5;display:flex;align-items:center;justify-content:space-between;padding:12px 28px;position:sticky;top:0;z-index:15}.topbar h1{font-size:20px;margin:2px 0 0}.top-actions{display:flex;align-items:center;gap:11px}.date-pill{font-size:12px;background:#f1f5f9;padding:8px 10px;border-radius:10px;color:#64748b}.user-chip{display:flex;align-items:center;gap:8px}.user-chip>span{width:35px;height:35px;border-radius:11px;background:#dbeafe;color:#1d4ed8;display:grid;place-items:center;font-weight:900}.user-chip>div{display:flex;flex-direction:column}.user-chip b{font-size:12px}.user-chip small{font-size:10px;color:#8794a8}.content{padding:26px;max-width:1700px;margin:0 auto}.section-header{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;margin-bottom:17px}.section-header h2{margin:0;font-size:22px}.section-header p{margin:5px 0 0;color:#718096;font-size:13px;line-height:1.5}.section-actions{display:flex;gap:8px}.metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.metric-card{background:white;border:1px solid #e9eef6;border-radius:15px;padding:17px;display:flex;gap:13px;align-items:flex-start;box-shadow:0 5px 20px rgba(15,23,42,.035)}.metric-icon{width:39px;height:39px;border-radius:12px;background:#eef4ff;color:#2563eb;display:grid;place-items:center;font-size:18px;font-weight:900}.metric-value{font-size:20px;font-weight:900;letter-spacing:-.02em}.metric-label{font-size:11px;font-weight:800;color:#5f6d82;margin-top:2px}.metric-hint{font-size:10px;color:#9aa5b5;margin-top:4px}.grid-main-side{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.75fr);gap:17px}.grid-2-cards{display:grid;grid-template-columns:1fr 1fr;gap:17px;margin-top:17px}.card,.map-card{background:white;border:1px solid #e6ecf4;border-radius:16px;box-shadow:0 6px 22px rgba(15,23,42,.035)}.card{padding:18px}.card h3{margin:0 0 10px;font-size:15px}.muted{color:#77859a;font-size:12px;line-height:1.55}.map-card{overflow:hidden}.map-title-row{padding:13px 15px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #edf1f6}.map-title-row>div{display:flex;flex-direction:column;gap:3px}.map-title-row strong{font-size:13px}.map-title-row span{font-size:10px;color:#8895a7}.google-map{width:100%;background:#e8edf4}.map-error{padding:10px 14px;background:#fff1f2;color:#be123c;font-size:11px}.badge{display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;border-radius:999px;font-size:9px;font-weight:900;letter-spacing:.03em;white-space:nowrap}.badge.good{background:#dcfce7;color:#15803d}.badge.bad{background:#fee2e2;color:#b91c1c}.badge.warn{background:#fef3c7;color:#a16207}.badge.neutral{background:#eef2f7;color:#526174}.vehicle-visual{display:flex;flex-direction:column;align-items:center;text-align:center;padding:16px 4px 20px}.power-ring{width:82px;height:82px;border-radius:50%;display:grid;place-items:center;font-size:30px;margin-bottom:12px}.power-ring.on{background:#dcfce7;color:#15803d;box-shadow:0 0 0 10px #f0fdf4}.power-ring.off{background:#fee2e2;color:#b91c1c;box-shadow:0 0 0 10px #fff1f2}.vehicle-visual b{font-size:16px}.vehicle-visual span{font-size:11px;color:#8491a3;margin-top:5px}.button-row{display:flex;gap:9px;flex-wrap:wrap}.button-row>*{flex:1}.mini-list{display:flex;flex-direction:column;margin-top:14px;border-top:1px solid #edf1f6}.mini-list>div{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #edf1f6;font-size:11px}.mini-list>div>span{color:#6f7d91}.mini-list.big>div{padding:13px 0}.mini-list.big>div>span{font-size:12px}.table-wrap{overflow:auto}.table-wrap table{width:100%;border-collapse:collapse;min-width:650px}.table-wrap th{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#8491a3;text-align:left;padding:10px;border-bottom:1px solid #e8edf4;background:#fbfcfe}.table-wrap td{padding:11px 10px;border-bottom:1px solid #eef2f6;font-size:11px;vertical-align:middle}.table-wrap tr:hover td{background:#fafcff}.table-wrap small{color:#8a97aa}.wrap-cell{min-width:180px;white-space:normal}.empty{text-align:center;padding:35px 16px;color:#93a0b2;font-size:12px}.timeline{display:flex;flex-direction:column}.timeline-item{display:grid;grid-template-columns:14px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid #eef2f6}.timeline-item:last-child{border-bottom:0}.event-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;background:#60a5fa}.event-dot.warning{background:#f59e0b}.event-dot.error{background:#ef4444}.event-dot.success{background:#22c55e}.timeline-item b{font-size:11px}.timeline-item p{font-size:11px;color:#58687e;line-height:1.4;margin:3px 0}.timeline-item small{font-size:9px;color:#96a1b1}.timeline.compact .timeline-item{padding:8px 0}.timeline-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.destination-list{display:flex;flex-direction:column}.destination-row{display:grid;grid-template-columns:42px minmax(130px,1fr) 90px auto;gap:11px;align-items:center;padding:12px 0;border-bottom:1px solid #edf1f6}.destination-number,.stop-number{width:34px;height:34px;border-radius:10px;background:#e8efff;color:#2563eb;display:grid;place-items:center;font-weight:900}.destination-info{display:flex;flex-direction:column;gap:3px}.destination-info b{font-size:12px}.destination-info span{font-size:10px;color:#8694a7}.destination-price{font-weight:900;font-size:13px}.destination-actions{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.mini{border:0;border-radius:8px;padding:6px 8px;font-size:9px;font-weight:800}.toggle-line{display:flex;gap:9px;align-items:center;background:#f8fafc;padding:11px;border-radius:10px;font-size:12px;font-weight:700;margin:6px 0 14px}.top-gap{margin-top:17px}.top-gap-sm{margin-top:10px}.storage-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:17px}.storage-card{text-align:center}.storage-icon{width:66px;height:66px;border-radius:20px;background:#e8efff;color:#2563eb;display:grid;place-items:center;font-size:28px;margin:0 auto 14px}.storage-card p{max-width:650px;margin:0 auto 20px;color:#718096;font-size:12px;line-height:1.6}.storage-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.storage-stats span{background:#f8fafc;border-radius:10px;padding:10px;display:flex;flex-direction:column;font-size:9px;color:#7b8797}.storage-stats b{font-size:17px;color:#182337;margin-top:2px}.stack-buttons{display:flex;flex-direction:column;gap:8px}.card code{display:block;background:#101827;color:#d8e9ff;border-radius:10px;padding:12px;overflow:auto}.compact-metrics{margin-top:0}.user-theme .sidebar{background:#102622}.user-theme .sidebar nav button.active{background:#184139;box-shadow:inset 3px 0 #34d399}.user-theme .logo{background:linear-gradient(135deg,#059669,#0ea5e9)}.welcome-card{background:linear-gradient(125deg,#0f766e,#164e63);color:white;border-radius:18px;padding:24px 26px;display:flex;justify-content:space-between;align-items:center;margin-bottom:17px;box-shadow:0 12px 34px rgba(15,118,110,.2)}.welcome-card .eyebrow{color:#99f6e4}.welcome-card h2{font-size:28px;margin:5px 0}.welcome-card p{margin:0;color:#ccfbf1;font-size:12px}.welcome-status{display:flex;flex-direction:column;align-items:center;border:1px solid rgba(255,255,255,.2);border-radius:15px;padding:12px 20px;background:rgba(255,255,255,.07)}.welcome-status span{font-size:9px;color:#bceae4}.welcome-status b{font-size:25px}.green{color:#86efac}.red{color:#fecaca}.destination-cards{display:grid;grid-template-columns:1fr 1fr;gap:9px}.destination-card{border:1px solid #e3eaf3;background:#fbfdff;border-radius:13px;padding:12px;display:grid;grid-template-columns:1fr;gap:9px;align-items:center;text-align:left}.destination-card:hover:not(:disabled),.destination-card.selected{border-color:#60a5fa;background:#f3f8ff}.destination-card>div{display:flex;flex-direction:column;gap:3px}.destination-card b{font-size:11px}.destination-card small{font-size:9px;color:#8a97aa}.destination-card strong{font-size:12px;color:#0f766e}.gps-hero{padding:20px;text-align:center;background:#f8fafc;border-radius:14px;margin:12px 0}.gps-hero>div{font-size:30px}.gps-hero b{display:block;font-size:13px;margin:6px 0}.gps-hero span{font-size:10px;color:#7a8799}.gps-hero.live{background:#ecfdf5}.geo-alert{margin-top:13px;padding:11px;border-radius:11px;display:flex;flex-direction:column;gap:3px}.geo-alert.good{background:#ecfdf5;color:#166534}.geo-alert.bad{background:#fef2f2;color:#991b1b}.geo-alert b{font-size:11px}.geo-alert span{font-size:9px}.ride-hero{display:grid;grid-template-columns:54px 1fr auto;align-items:center;gap:13px}.stop-number.large{width:46px;height:46px;font-size:17px}.ride-destination h2{font-size:22px;margin:2px 0}.ride-destination p{font-size:10px;color:#8090a5;margin:0}.ride-price{text-align:right}.ride-price span{display:block;font-size:9px;color:#8996a7}.ride-price b{font-size:26px}.workflow-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}.workflow-card{position:relative;background:white;border:1px solid #e5eaf1;border-radius:15px;padding:16px;padding-top:22px;opacity:.72}.workflow-card.active{border-color:#60a5fa;box-shadow:0 0 0 2px rgba(96,165,250,.08);opacity:1}.workflow-card.done{border-color:#86efac;background:#fbfffc;opacity:1}.workflow-card .step{position:absolute;top:-10px;left:14px;width:23px;height:23px;border-radius:8px;background:#dbeafe;color:#1d4ed8;display:grid;place-items:center;font-size:10px;font-weight:900}.workflow-card.done .step{background:#dcfce7;color:#15803d}.workflow-card h3{font-size:13px;margin:0 0 6px}.workflow-card p{font-size:10px;line-height:1.5;color:#78879a;min-height:46px}.otp-display{font-size:24px;letter-spacing:.16em;font-weight:900;text-align:center;background:#eff6ff;color:#1d4ed8;border-radius:10px;padding:10px}.otp-input{text-align:center;font-size:19px;font-weight:900;letter-spacing:.12em;margin:0 0 9px}.workflow-amount{text-align:center;font-size:23px;font-weight:900;color:#0f766e;margin:9px 0}.workflow-status{display:flex;gap:5px;flex-wrap:wrap;min-height:43px;align-items:center}.center-btn{display:block;margin:0 auto}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);z-index:100;display:grid;place-items:center;padding:18px;backdrop-filter:blur(4px)}.modal{width:min(650px,100%);background:white;border-radius:20px;padding:22px;box-shadow:0 30px 90px rgba(0,0,0,.25)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start}.modal-head h2{margin:3px 0 0}.close{width:35px;height:35px;border:0;border-radius:10px;background:#f1f5f9;font-size:22px}.payment-summary{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;background:#f8fafc;border-radius:12px;padding:12px;margin:16px 0}.payment-summary>div{display:flex;flex-direction:column;gap:3px}.payment-summary span{font-size:9px;color:#8390a1}.payment-summary b{font-size:11px}.payment-summary .amount b{font-size:20px;color:#0f766e}.payment-methods{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:15px}.payment-methods button{border:1px solid #e2e8f0;background:white;border-radius:11px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:4px;color:#5d6b7e}.payment-methods button span{font-size:20px}.payment-methods button b{font-size:9px}.payment-methods button.active{border-color:#3b82f6;background:#eff6ff;color:#1d4ed8}.demo-banner{padding:10px;border-radius:10px;background:#fffbeb;color:#92400e;font-size:10px;margin-bottom:12px}.pay-button{padding:13px}.toast{position:fixed;right:20px;bottom:20px;z-index:200;width:min(370px,calc(100vw - 40px));background:#0f172a;color:white;border-radius:14px;padding:14px 42px 14px 15px;box-shadow:0 18px 50px rgba(15,23,42,.28);display:flex;flex-direction:column;gap:3px}.toast.success{background:#14532d}.toast.error{background:#7f1d1d}.toast.warning{background:#78350f}.toast strong{font-size:12px}.toast span{font-size:10px;color:rgba(255,255,255,.8);line-height:1.45}.toast button{position:absolute;right:10px;top:8px;border:0;background:transparent;color:white;font-size:20px}.fatal{min-height:100vh;display:grid;place-items:center;font-weight:800}.reverse-mobile{}.payment-modal select{cursor:pointer}
-@media(max-width:1180px){.metrics-grid{grid-template-columns:1fr 1fr}.workflow-grid{grid-template-columns:1fr 1fr}.destination-row{grid-template-columns:40px 1fr 80px}.destination-actions{grid-column:2/4;justify-content:flex-start}.grid-main-side{grid-template-columns:1fr}.storage-grid{grid-template-columns:1fr}.grid-2-cards{grid-template-columns:1fr}}
+*{box-sizing:border-box}html,body,#root{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f4f7fb}button,input,textarea,select{font:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}body{overflow-x:hidden}.auth-shell{min-height:100vh;display:grid;grid-template-columns:1.08fr .92fr;background:#eef3fb}.auth-brand-panel{padding:7vh 7vw;display:flex;flex-direction:column;justify-content:center;background:radial-gradient(circle at 20% 20%,rgba(59,130,246,.22),transparent 28%),linear-gradient(145deg,#07142d,#0c2853 55%,#164e63);color:white;position:relative;overflow:hidden}.auth-brand-panel:after{content:"";position:absolute;width:420px;height:420px;border:1px solid rgba(255,255,255,.08);border-radius:50%;right:-160px;bottom:-160px;box-shadow:0 0 0 60px rgba(255,255,255,.025),0 0 0 120px rgba(255,255,255,.02)}.logo{width:44px;height:44px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(135deg,#2563eb,#06b6d4);color:white;font-weight:900;box-shadow:0 10px 24px rgba(37,99,235,.28)}.logo.big{width:68px;height:68px;border-radius:21px;font-size:22px;margin-bottom:28px}.eyebrow{font-size:11px;letter-spacing:.16em;font-weight:800;color:#5f718c}.auth-brand-panel .eyebrow{color:#8dd6ff}.auth-brand-panel h1{font-size:clamp(38px,5vw,68px);line-height:1.02;max-width:760px;margin:14px 0 22px;letter-spacing:-.045em}.auth-brand-panel>p{font-size:17px;line-height:1.75;color:#c4d5eb;max-width:720px}.auth-feature-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:28px;max-width:700px}.auth-feature-grid div{padding:15px 16px;border:1px solid rgba(255,255,255,.13);background:rgba(255,255,255,.06);border-radius:15px;font-weight:700;color:#e8f1ff}.local-note{margin-top:32px;display:flex;flex-direction:column;gap:5px;padding-left:15px;border-left:3px solid #38bdf8;color:#cfe6ff}.local-note strong{color:white}.auth-form-panel{display:grid;place-items:center;padding:36px}.auth-card{background:white;border-radius:26px;padding:34px;width:min(610px,100%);box-shadow:0 26px 70px rgba(15,23,42,.12);max-height:92vh;overflow:auto}.role-switch{display:grid;grid-template-columns:1fr 1fr;background:#eef2f8;border-radius:13px;padding:5px;margin-bottom:25px}.role-switch button{border:0;background:transparent;border-radius:10px;padding:11px;font-weight:800;color:#667085}.role-switch button.active{background:white;color:#1d4ed8;box-shadow:0 3px 14px rgba(15,23,42,.08)}.auth-title h2{font-size:28px;margin:0 0 8px}.auth-title p{color:#718096;margin:0 0 24px;line-height:1.55}.field{display:flex;flex-direction:column;gap:7px;margin-bottom:15px}.field>span{font-size:12px;font-weight:800;color:#40516b}.field small{font-size:11px;color:#8794a8}.field-error{font-size:12px;color:#be123c;margin:-8px 0 12px}.field input,.field textarea,.field select,.otp-input{width:100%;border:1px solid #dce3ed;border-radius:11px;padding:12px 13px;outline:none;background:#fbfcfe;color:#172033;transition:.18s}.field textarea{min-height:72px;resize:vertical}.field input:focus,.field textarea:focus,.field select:focus,.otp-input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.1);background:white}.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:13px}.primary,.success,.danger,.ghost,.danger-outline{border:0;border-radius:11px;padding:11px 15px;font-weight:800;transition:.15s}.primary{background:#2563eb;color:white;box-shadow:0 8px 18px rgba(37,99,235,.18)}.primary:hover{background:#1d4ed8}.success{background:#159447;color:white}.danger{background:#dc2626;color:white}.ghost{background:#eef3fa;color:#34445d}.danger-outline{background:#fff1f2;color:#be123c;border:1px solid #fecdd3}.wide{width:100%}.text-btn{border:0;background:transparent;color:#2563eb;font-weight:800;width:100%;margin-top:14px}.demo-creds{font-size:12px;color:#6b7280;background:#f8fafc;padding:10px;border-radius:9px;margin-bottom:15px}.app-shell{min-height:100vh}.sidebar{position:fixed;left:0;top:0;width:246px;height:100vh;background:#0d1b33;color:#c9d5e8;padding:19px 14px;display:flex;flex-direction:column;overflow-y:auto;z-index:20}.brand-row{display:flex;gap:11px;align-items:center;padding:4px 8px 17px;border-bottom:1px solid rgba(255,255,255,.08)}.brand-row>div:last-child{display:flex;flex-direction:column}.brand-row b{font-size:15px;color:white}.brand-row span{font-size:10px;color:#7387a9}.sidebar-role{display:flex;flex-direction:column;gap:4px;padding:20px 10px 10px}.sidebar-role>span{font-size:9px;letter-spacing:.15em;color:#6d82a7;font-weight:900}.sidebar-role b{font-size:13px;color:white}.sidebar-role small{font-size:11px;color:#8ea0bd}.sidebar nav{display:flex;flex-direction:column;gap:4px;margin-top:7px}.sidebar nav button{border:0;background:transparent;color:#93a6c4;padding:10px 11px;border-radius:10px;text-align:left;display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700}.sidebar nav button i{font-style:normal;width:19px;text-align:center;font-size:16px}.sidebar nav button.active,.sidebar nav button:hover{background:#193255;color:white}.sidebar nav button.active{box-shadow:inset 3px 0 #38bdf8}.sidebar-bottom{margin-top:auto;border-top:1px solid rgba(255,255,255,.08);padding-top:15px}.hardware-mini{display:flex;gap:9px;align-items:center;padding:8px}.hardware-mini>div{display:flex;flex-direction:column}.hardware-mini b{font-size:11px;color:white}.hardware-mini small{font-size:10px;color:#7184a5}.dot{width:9px;height:9px;border-radius:50%;background:#94a3b8;box-shadow:0 0 0 4px rgba(148,163,184,.12)}.dot.good{background:#22c55e}.dot.warn{background:#f59e0b}.dot.bad{background:#ef4444}.logout{margin-top:7px;width:100%;border:0;background:rgba(255,255,255,.05);color:#9fb0c9;border-radius:10px;padding:10px;font-weight:700}.main{min-width:0;margin-left:246px}.topbar{height:78px;background:white;border-bottom:1px solid #e9eef5;display:flex;align-items:center;justify-content:space-between;padding:12px 28px;position:sticky;top:0;z-index:15}.topbar h1{font-size:20px;margin:2px 0 0}.top-actions{display:flex;align-items:center;gap:11px}.date-pill{font-size:12px;background:#f1f5f9;padding:8px 10px;border-radius:10px;color:#64748b}.user-chip{display:flex;align-items:center;gap:8px}.user-chip>span{width:35px;height:35px;border-radius:11px;background:#dbeafe;color:#1d4ed8;display:grid;place-items:center;font-weight:900}.user-chip>div{display:flex;flex-direction:column}.user-chip b{font-size:12px}.user-chip small{font-size:10px;color:#8794a8}.content{padding:26px;max-width:1700px;margin:0 auto}.section-header{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;margin-bottom:17px}.section-header h2{margin:0;font-size:22px}.section-header p{margin:5px 0 0;color:#718096;font-size:13px;line-height:1.5}.section-actions{display:flex;gap:8px}.metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.metric-card{background:white;border:1px solid #e9eef6;border-radius:15px;padding:17px;display:flex;gap:13px;align-items:flex-start;box-shadow:0 5px 20px rgba(15,23,42,.035)}.metric-icon{width:39px;height:39px;border-radius:12px;background:#eef4ff;color:#2563eb;display:grid;place-items:center;font-size:18px;font-weight:900}.metric-value{font-size:20px;font-weight:900;letter-spacing:-.02em}.metric-label{font-size:11px;font-weight:800;color:#5f6d82;margin-top:2px}.metric-hint{font-size:10px;color:#9aa5b5;margin-top:4px}.grid-main-side{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.75fr);gap:17px}.grid-2-cards{display:grid;grid-template-columns:1fr 1fr;gap:17px;margin-top:17px}.card,.map-card{background:white;border:1px solid #e6ecf4;border-radius:16px;box-shadow:0 6px 22px rgba(15,23,42,.035)}.card{padding:18px}.card h3{margin:0 0 10px;font-size:15px}.muted{color:#77859a;font-size:12px;line-height:1.55}.map-card{overflow:hidden}.map-title-row{padding:13px 15px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #edf1f6}.map-title-row>div{display:flex;flex-direction:column;gap:3px}.map-title-row strong{font-size:13px}.map-title-row span{font-size:10px;color:#8895a7}.google-map{width:100%;background:#e8edf4}.map-error{padding:10px 14px;background:#fff1f2;color:#be123c;font-size:11px}.badge{display:inline-flex;align-items:center;justify-content:center;padding:5px 8px;border-radius:999px;font-size:9px;font-weight:900;letter-spacing:.03em;white-space:nowrap}.badge.good{background:#dcfce7;color:#15803d}.badge.bad{background:#fee2e2;color:#b91c1c}.badge.warn{background:#fef3c7;color:#a16207}.badge.neutral{background:#eef2f7;color:#526174}.vehicle-visual{display:flex;flex-direction:column;align-items:center;text-align:center;padding:16px 4px 20px}.power-ring{width:82px;height:82px;border-radius:50%;display:grid;place-items:center;font-size:30px;margin-bottom:12px}.power-ring.on{background:#dcfce7;color:#15803d;box-shadow:0 0 0 10px #f0fdf4}.power-ring.off{background:#fee2e2;color:#b91c1c;box-shadow:0 0 0 10px #fff1f2}.vehicle-visual b{font-size:16px}.vehicle-visual span{font-size:11px;color:#8491a3;margin-top:5px}.button-row{display:flex;gap:9px;flex-wrap:wrap}.button-row>*{flex:1}.mini-list{display:flex;flex-direction:column;margin-top:14px;border-top:1px solid #edf1f6}.mini-list>div{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #edf1f6;font-size:11px}.mini-list>div>span{color:#6f7d91}.mini-list.big>div{padding:13px 0}.mini-list.big>div>span{font-size:12px}.table-wrap{overflow:auto}.table-wrap table{width:100%;border-collapse:collapse;min-width:650px}.table-wrap th{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#8491a3;text-align:left;padding:10px;border-bottom:1px solid #e8edf4;background:#fbfcfe}.table-wrap td{padding:11px 10px;border-bottom:1px solid #eef2f6;font-size:11px;vertical-align:middle}.table-wrap tr:hover td{background:#fafcff}.table-wrap small{color:#8a97aa}.wrap-cell{min-width:180px;white-space:normal}.empty{text-align:center;padding:35px 16px;color:#93a0b2;font-size:12px}.timeline{display:flex;flex-direction:column}.timeline-item{display:grid;grid-template-columns:14px 1fr;gap:10px;padding:10px 0;border-bottom:1px solid #eef2f6}.timeline-item:last-child{border-bottom:0}.event-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;background:#60a5fa}.event-dot.warning{background:#f59e0b}.event-dot.error{background:#ef4444}.event-dot.success{background:#22c55e}.timeline-item b{font-size:11px}.timeline-item p{font-size:11px;color:#58687e;line-height:1.4;margin:3px 0}.timeline-item small{font-size:9px;color:#96a1b1}.timeline.compact .timeline-item{padding:8px 0}.timeline-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.destination-list{display:flex;flex-direction:column}.destination-row{display:grid;grid-template-columns:1fr auto;gap:11px;align-items:center;padding:12px 0;border-bottom:1px solid #edf1f6}.destination-row.selected{background:#f3f8ff}.destination-number,.stop-number{width:34px;height:34px;border-radius:10px;background:#e8efff;color:#2563eb;display:grid;place-items:center;font-weight:900}.destination-info{display:flex;flex-direction:column;gap:3px}.destination-info b{font-size:12px}.destination-info span{font-size:10px;color:#8694a7}.destination-price{font-weight:900;font-size:13px}.destination-actions{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}.mini{border:0;border-radius:8px;padding:6px 8px;font-size:9px;font-weight:800}.toggle-line{display:flex;gap:9px;align-items:center;background:#f8fafc;padding:11px;border-radius:10px;font-size:12px;font-weight:700;margin:6px 0 14px}.top-gap{margin-top:17px}.top-gap-sm{margin-top:10px}.storage-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:17px}.storage-card{text-align:center}.storage-icon{width:66px;height:66px;border-radius:20px;background:#e8efff;color:#2563eb;display:grid;place-items:center;font-size:28px;margin:0 auto 14px}.storage-card p{max-width:650px;margin:0 auto 20px;color:#718096;font-size:12px;line-height:1.6}.storage-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.storage-stats span{background:#f8fafc;border-radius:10px;padding:10px;display:flex;flex-direction:column;font-size:9px;color:#7b8797}.storage-stats b{font-size:17px;color:#182337;margin-top:2px}.stack-buttons{display:flex;flex-direction:column;gap:8px}.card code{display:block;background:#101827;color:#d8e9ff;border-radius:10px;padding:12px;overflow:auto}.compact-metrics{margin-top:0}.user-theme .sidebar{background:#102622}.user-theme .sidebar nav button.active{background:#184139;box-shadow:inset 3px 0 #34d399}.user-theme .logo{background:linear-gradient(135deg,#059669,#0ea5e9)}.welcome-card{background:linear-gradient(125deg,#0f766e,#164e63);color:white;border-radius:18px;padding:24px 26px;display:flex;justify-content:space-between;align-items:center;margin-bottom:17px;box-shadow:0 12px 34px rgba(15,118,110,.2)}.welcome-card .eyebrow{color:#99f6e4}.welcome-card h2{font-size:28px;margin:5px 0}.welcome-card p{margin:0;color:#ccfbf1;font-size:12px}.welcome-status{display:flex;flex-direction:column;align-items:center;border:1px solid rgba(255,255,255,.2);border-radius:15px;padding:12px 20px;background:rgba(255,255,255,.07)}.welcome-status span{font-size:9px;color:#bceae4}.welcome-status b{font-size:25px}.green{color:#86efac}.red{color:#fecaca}.destination-cards{display:grid;grid-template-columns:1fr 1fr;gap:9px}.destination-card{border:1px solid #e3eaf3;background:#fbfdff;border-radius:13px;padding:12px;display:grid;grid-template-columns:1fr;gap:9px;align-items:center;text-align:left}.destination-card:hover:not(:disabled),.destination-card.selected{border-color:#60a5fa;background:#f3f8ff}.destination-card>div{display:flex;flex-direction:column;gap:3px}.destination-card b{font-size:11px}.destination-card small{font-size:9px;color:#8a97aa}.destination-card strong{font-size:12px;color:#0f766e}.gps-hero{padding:20px;text-align:center;background:#f8fafc;border-radius:14px;margin:12px 0}.gps-hero>div{font-size:30px}.gps-hero b{display:block;font-size:13px;margin:6px 0}.gps-hero span{font-size:10px;color:#7a8799}.gps-hero.live{background:#ecfdf5}.geo-alert{margin-top:13px;padding:11px;border-radius:11px;display:flex;flex-direction:column;gap:3px}.geo-alert.good{background:#ecfdf5;color:#166534}.geo-alert.bad{background:#fef2f2;color:#991b1b}.geo-alert b{font-size:11px}.geo-alert span{font-size:9px}.ride-hero{display:grid;grid-template-columns:54px 1fr auto;align-items:center;gap:13px}.stop-number.large{width:46px;height:46px;font-size:17px}.ride-destination h2{font-size:22px;margin:2px 0}.ride-destination p{font-size:10px;color:#8090a5;margin:0}.ride-price{text-align:right}.ride-price span{display:block;font-size:9px;color:#8996a7}.ride-price b{font-size:26px}.workflow-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:14px}.workflow-card{position:relative;background:white;border:1px solid #e5eaf1;border-radius:15px;padding:16px;padding-top:22px;opacity:.72}.workflow-card.active{border-color:#60a5fa;box-shadow:0 0 0 2px rgba(96,165,250,.08);opacity:1}.workflow-card.done{border-color:#86efac;background:#fbfffc;opacity:1}.workflow-card .step{position:absolute;top:-10px;left:14px;width:23px;height:23px;border-radius:8px;background:#dbeafe;color:#1d4ed8;display:grid;place-items:center;font-size:10px;font-weight:900}.workflow-card.done .step{background:#dcfce7;color:#15803d}.workflow-card h3{font-size:13px;margin:0 0 6px}.workflow-card p{font-size:10px;line-height:1.5;color:#78879a;min-height:46px}.otp-display{font-size:24px;letter-spacing:.16em;font-weight:900;text-align:center;background:#eff6ff;color:#1d4ed8;border-radius:10px;padding:10px}.otp-input{text-align:center;font-size:19px;font-weight:900;letter-spacing:.12em;margin:0 0 9px}.workflow-amount{text-align:center;font-size:23px;font-weight:900;color:#0f766e;margin:9px 0}.workflow-status{display:flex;gap:5px;flex-wrap:wrap;min-height:43px;align-items:center}.center-btn{display:block;margin:0 auto}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.62);z-index:100;display:grid;place-items:center;padding:18px;backdrop-filter:blur(4px)}.modal{width:min(650px,100%);background:white;border-radius:20px;padding:22px;box-shadow:0 30px 90px rgba(0,0,0,.25)}.modal-head{display:flex;justify-content:space-between;align-items:flex-start}.modal-head h2{margin:3px 0 0}.close{width:35px;height:35px;border:0;border-radius:10px;background:#f1f5f9;font-size:22px}.payment-summary{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;background:#f8fafc;border-radius:12px;padding:12px;margin:16px 0}.payment-summary>div{display:flex;flex-direction:column;gap:3px}.payment-summary span{font-size:9px;color:#8390a1}.payment-summary b{font-size:11px}.payment-summary .amount b{font-size:20px;color:#0f766e}.payment-methods{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-bottom:15px}.payment-methods button{border:1px solid #e2e8f0;background:white;border-radius:11px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:4px;color:#5d6b7e}.payment-methods button span{font-size:20px}.payment-methods button b{font-size:9px}.payment-methods button.active{border-color:#3b82f6;background:#eff6ff;color:#1d4ed8}.demo-banner{padding:10px;border-radius:10px;background:#fffbeb;color:#92400e;font-size:10px;margin-bottom:12px}.pay-button{padding:13px}.toast{position:fixed;right:20px;bottom:20px;z-index:200;width:min(370px,calc(100vw - 40px));background:#0f172a;color:white;border-radius:14px;padding:14px 42px 14px 15px;box-shadow:0 18px 50px rgba(15,23,42,.28);display:flex;flex-direction:column;gap:3px}.toast.success{background:#14532d}.toast.error{background:#7f1d1d}.toast.warning{background:#78350f}.toast strong{font-size:12px}.toast span{font-size:10px;color:rgba(255,255,255,.8);line-height:1.45}.toast button{position:absolute;right:10px;top:8px;border:0;background:transparent;color:white;font-size:20px}.fatal{min-height:100vh;display:grid;place-items:center;font-weight:800}.reverse-mobile{}.payment-modal select{cursor:pointer}
+@media(max-width:1180px){.metrics-grid{grid-template-columns:1fr 1fr}.workflow-grid{grid-template-columns:1fr 1fr}.destination-row{grid-template-columns:1fr;row-gap:8px}.destination-actions{justify-content:flex-start}.grid-main-side{grid-template-columns:1fr}.storage-grid{grid-template-columns:1fr}.grid-2-cards{grid-template-columns:1fr}}
 @media(max-width:820px){.auth-shell{grid-template-columns:1fr}.auth-brand-panel{display:none}.auth-form-panel{padding:17px;min-height:100vh}.auth-card{padding:22px;max-height:none}.sidebar{position:fixed;left:0;right:0;bottom:0;top:auto;width:auto;height:66px;padding:7px 8px;display:block;background:#0d1b33;z-index:50;border-top:1px solid rgba(255,255,255,.1);overflow-y:visible}.brand-row,.sidebar-role,.sidebar-bottom{display:none}.sidebar nav{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin:0;height:100%;overflow-x:auto}.sidebar nav button{padding:5px;display:flex;flex-direction:column;justify-content:center;gap:2px;text-align:center;min-width:58px}.sidebar nav button i{font-size:15px}.sidebar nav button span{font-size:8px}.sidebar nav button.active{box-shadow:none;background:#193255}.main{margin-left:0;padding-bottom:70px}.topbar{height:68px;padding:10px 14px}.topbar h1{font-size:17px}.date-pill,.user-chip>div{display:none}.content{padding:15px}.section-header{align-items:flex-start;flex-direction:column}.section-actions{width:100%}.section-actions>*{flex:1}.metrics-grid{grid-template-columns:1fr 1fr;gap:9px}.metric-card{padding:12px}.metric-value{font-size:16px}.metric-icon{width:34px;height:34px}.grid-2-cards{grid-template-columns:1fr}.grid-2{grid-template-columns:1fr}.destination-cards{grid-template-columns:1fr}.workflow-grid{grid-template-columns:1fr 1fr}.payment-methods{grid-template-columns:1fr 1fr}.payment-summary{grid-template-columns:1fr 1fr}.payment-summary .amount{grid-column:1/3}.storage-stats{grid-template-columns:1fr 1fr}.welcome-card{padding:18px}.welcome-card p{max-width:70%}.ride-hero{grid-template-columns:45px 1fr}.ride-price{grid-column:2;text-align:left}.map-title-row{align-items:flex-start;gap:8px}.google-map{min-height:320px}}
 @media(max-width:520px){.auth-form-panel{padding:0}.auth-card{min-height:100vh;border-radius:0;box-shadow:none;padding:20px 16px}.metrics-grid{grid-template-columns:1fr}.workflow-grid{grid-template-columns:1fr}.sidebar nav{grid-template-columns:repeat(6,68px)}.top-actions .badge{display:none}.content{padding:12px}.card{padding:14px}.welcome-card{align-items:flex-start}.welcome-status{padding:9px 12px}.welcome-card p{max-width:100%}.destination-row{grid-template-columns:36px 1fr 70px}.destination-card{grid-template-columns:34px 1fr auto}.button-row{flex-direction:column}.payment-methods{grid-template-columns:1fr 1fr}.modal{padding:16px}.toast{right:12px;bottom:78px;width:calc(100vw - 24px)}.section-header h2{font-size:19px}}
 `;
